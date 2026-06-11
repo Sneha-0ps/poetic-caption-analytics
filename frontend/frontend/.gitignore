@@ -1,0 +1,22 @@
+# Node
+node_modules/
+npm-debug.log
+
+# Environment files
+.env
+backend/.env
+frontend/frontend/.env
+
+# Uploads
+uploads/
+backend/uploads/
+
+# Python
+__pycache__/
+*.pyc
+
+# Build files
+dist/
+
+# OS
+.DS_Store

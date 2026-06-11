@@ -1,0 +1,22 @@
+# Environment variables
+.env
+**/.env
+
+# Node modules
+node_modules/
+
+# Upload files
+uploads/
+
+# Build files
+dist/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
