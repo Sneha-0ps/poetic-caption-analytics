@@ -41,7 +41,7 @@ const dbManager = {
       return;
     }
     try {
-      console.log("Mongo URI exists:", !!process.env.MONGO_URI);
+      console.log("Mongo URI exists:", !!process.env.MONGODB_URI);
       await mongoose.connect(mongoUri);
       console.log("⚙️  MongoDB connected successfully.");
       useLocalDb = false;
