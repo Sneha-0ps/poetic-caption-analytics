@@ -5,23 +5,20 @@ const path = require('path');
 const fs = require('fs');
 const cloudinary = require('cloudinary').v2;
 const db = require('./db');
-const queueManager = require('./queue');
 const processCaptionJob = require('./worker');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ── Cloudinary config ─────────────────────────────────────────────────────────
-if (process.env.CLOUDINARY_URL || process.env.CLOUDINARY_CLOUD_NAME) {
+// ── Cloudinary ────────────────────────────────────────────────────────────────
+if (process.env.CLOUDINARY_CLOUD_NAME) {
   cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key:    process.env.CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET,
   });
   console.log("☁️  Cloudinary configured.");
-} else {
-  console.warn("⚠️  No Cloudinary credentials. Images will use local storage (not suitable for production).");
 }
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
@@ -39,26 +36,24 @@ app.use(cors({
       o instanceof RegExp ? o.test(origin) : o === origin
     );
     if (allowed) return callback(null, true);
-    console.warn(`CORS blocked: ${origin}`);
-    callback(new Error(`CORS policy: origin ${origin} not allowed`));
+    callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-
 app.options(/.*/, cors());
 app.use(express.json());
 
-// ── Local uploads fallback (dev only) ─────────────────────────────────────────
+// ── Local uploads fallback ────────────────────────────────────────────────────
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// Multer stores to memory (works on Render — no disk dependency)
+// Memory storage — no disk needed
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) =>
   res.json({ status: 'ok', message: 'get_social API is running' })
 );
@@ -71,13 +66,10 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const user = await db.createUser(username, `hashed_${password}_secret`);
     res.status(201).json({
-      message: "User registered successfully",
       token: `mock_jwt_token_${user._id}`,
       user: { id: user._id, username: user.username }
     });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -89,68 +81,72 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user || user.passwordHash !== `hashed_${password}_secret`)
       return res.status(401).json({ error: "Invalid username or password" });
     res.status(200).json({
-      message: "Login successful",
       token: `mock_jwt_token_${user._id}`,
       user: { id: user._id, username: user.username }
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 function getUserIdFromReq(req) {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer mock_jwt_token_'))
-    return authHeader.split('_token_')[1];
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer mock_jwt_token_'))
+    return auth.split('_token_')[1];
   return 'usr_demo123';
 }
 
-// ── Upload — stores to Cloudinary, falls back to disk ─────────────────────────
+// ── Upload — synchronous processing (no queue, works on free Render) ──────────
 app.post('/api/posts/upload', upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Image file is required" });
   const userId = getUserIdFromReq(req);
 
   try {
+    // 1. Upload image to Cloudinary (permanent URL)
     let imageUrl;
-
     const hasCloudinary = process.env.CLOUDINARY_CLOUD_NAME &&
                           process.env.CLOUDINARY_API_KEY &&
                           process.env.CLOUDINARY_API_SECRET;
-
     if (hasCloudinary) {
-      // Upload buffer directly to Cloudinary (no temp file needed)
-      console.log("[Server] Uploading image to Cloudinary...");
-      const uploadResult = await new Promise((resolve, reject) => {
+      const result = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
           { folder: 'get_social', resource_type: 'image' },
-          (error, result) => error ? reject(error) : resolve(result)
+          (err, res) => err ? reject(err) : resolve(res)
         );
         stream.end(req.file.buffer);
       });
-      imageUrl = uploadResult.secure_url;
-      console.log("[Server] Cloudinary upload success:", imageUrl);
+      imageUrl = result.secure_url;
+      console.log("[Server] Cloudinary upload:", imageUrl);
     } else {
-      // Fallback: save to local disk (dev only)
-      const filename = Date.now() + '-' + Math.round(Math.random() * 1E9) +
-                       path.extname(req.file.originalname);
-      const filePath = path.join(UPLOADS_DIR, filename);
-      fs.writeFileSync(filePath, req.file.buffer);
+      const filename = Date.now() + path.extname(req.file.originalname);
+      fs.writeFileSync(path.join(UPLOADS_DIR, filename), req.file.buffer);
       imageUrl = `${process.env.BACKEND_URL || `http://localhost:${PORT}`}/uploads/${filename}`;
-      console.log("[Server] Saved to local disk:", imageUrl);
     }
 
+    // 2. Create post record with processing status
     const post = await db.createPost(userId, imageUrl);
-    await queueManager.addJob('caption_job', {
+
+    // 3. Return immediately so frontend starts showing the stepper
+    //    Then process in background using setImmediate (non-blocking)
+    res.status(202).json({
+      message: "Image uploaded. Processing started.",
       postId: post._id,
-      imageUrl,   // permanent Cloudinary URL — worker fetches this
-      imagePath: null,
-      userId
+      imageUrl,
+      status: "processing"
     });
 
-    res.status(202).json({
-      message: "Uploaded. Analysis job dispatched.",
-      postId: post._id, imageUrl, status: "processing"
+    // 4. Process AFTER response is sent — avoids Render request timeout
+    setImmediate(async () => {
+      try {
+        console.log(`[Server] Starting background processing for ${post._id}`);
+        await processCaptionJob({
+          data: { postId: post._id, imageUrl, imagePath: null, userId }
+        });
+        console.log(`[Server] Processing complete for ${post._id}`);
+      } catch (err) {
+        console.error(`[Server] Processing failed for ${post._id}:`, err.message);
+        try { await db.updatePost(post._id, { status: 'failed' }); } catch {}
+      }
     });
+
   } catch (err) {
     console.error("❌ Upload failed:", err);
     res.status(500).json({ error: err.message });
@@ -168,15 +164,7 @@ app.get('/api/posts/:id', async (req, res) => {
   try {
     const post = await db.getPostById(req.params.id);
     if (!post) return res.status(404).json({ error: "Post not found" });
-    let statusDetail = post.status;
-    if (statusDetail === 'processing') {
-      const jobStatus = queueManager.getJobStatus(post._id);
-      if (jobStatus?.status === 'failed') {
-        statusDetail = 'failed';
-        await db.updatePost(post._id, { status: 'failed' });
-      }
-    }
-    res.status(200).json({ ...post, status: statusDetail });
+    res.status(200).json(post);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -210,8 +198,10 @@ app.get('/api/analytics', async (req, res) => {
     const timeline = active
       .map(p => ({
         date: new Date(p.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-        likes: p.analytics.actualLikes, shares: p.analytics.actualShares,
-        predicted: p.analytics.predictedScore, rawDate: new Date(p.createdAt)
+        likes: p.analytics.actualLikes,
+        shares: p.analytics.actualShares,
+        predicted: p.analytics.predictedScore,
+        rawDate: new Date(p.createdAt)
       }))
       .sort((a, b) => a.rawDate - b.rawDate);
 
@@ -226,8 +216,7 @@ app.get('/api/analytics', async (req, res) => {
     });
     const tags = Object.keys(tagStats)
       .map(t => ({ tag: t, avgEngagement: Math.round(tagStats[t].total / tagStats[t].count), count: tagStats[t].count }))
-      .sort((a, b) => b.avgEngagement - a.avgEngagement)
-      .slice(0, 8);
+      .sort((a, b) => b.avgEngagement - a.avgEngagement).slice(0, 8);
 
     const totalLikes  = active.reduce((a, p) => a + p.analytics.actualLikes, 0);
     const totalShares = active.reduce((a, p) => a + p.analytics.actualShares, 0);
@@ -256,7 +245,7 @@ app.use((err, req, res, next) => {
 
 async function startServer() {
   await db.connectDB();
-  queueManager.initializeQueue(processCaptionJob);
+  // No queue needed anymore
   app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 }
 startServer();
