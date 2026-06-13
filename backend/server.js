@@ -134,7 +134,8 @@ app.post('/api/posts/upload', upload.single('image'), async (req, res) => {
     });
 
     // 4. Process AFTER response is sent — avoids Render request timeout
-    setImmediate(async () => {
+    // Small delay before starting so the 202 response is fully sent
+    setTimeout(async () => {
       try {
         console.log(`[Server] Starting background processing for ${post._id}`);
         await processCaptionJob({
@@ -164,6 +165,10 @@ app.get('/api/posts/:id', async (req, res) => {
   try {
     const post = await db.getPostById(req.params.id);
     if (!post) return res.status(404).json({ error: "Post not found" });
+    // Race condition guard: if completed but content not yet written, keep polling
+    if (post.status === "completed" && (!post.content?.variations?.length)) {
+      return res.status(200).json({ ...post, status: "processing" });
+    }
     res.status(200).json(post);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -249,3 +254,4 @@ async function startServer() {
   app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 }
 startServer();
+

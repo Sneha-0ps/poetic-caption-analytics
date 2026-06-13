@@ -3,6 +3,11 @@ const db = require('./db');
 
 const MOCK_AI_RESPONSES = [
   {
+    mood_tags: ["coastal", "serene", "natural"],
+    poetic_caption: "Whispers of the ocean sealed in every spiral and curve.",
+    short_captions: ["Nature's art, washed ashore. 🐚", "Sea treasures, sun-kissed sand. 🌊"]
+  },
+  {
     mood_tags: ["vintage", "romantic", "melancholy"],
     poetic_caption: "Whispers of autumn trapped in a silver frame...",
     short_captions: ["90s cinematic aesthetics. ✨", "Chasing golden hour memories."]
@@ -36,11 +41,6 @@ const MOCK_AI_RESPONSES = [
     mood_tags: ["foodie", "indulgent", "aesthetic"],
     poetic_caption: "Every bite tells a story of love and craft.",
     short_captions: ["Eat well, live well. 🍝", "Food is my love language. ❤️"]
-  },
-  {
-    mood_tags: ["dreamy", "soft", "ethereal"],
-    poetic_caption: "Floating between moments, lost in a pastel reverie.",
-    short_captions: ["Soft hours. 🌸", "Dream a little dream. ✨"]
   }
 ];
 
@@ -48,7 +48,6 @@ function getRandomMock() {
   return MOCK_AI_RESPONSES[Math.floor(Math.random() * MOCK_AI_RESPONSES.length)];
 }
 
-// Hard cap: if Gemini hasn't responded in 25s, give up and use mock
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -59,16 +58,14 @@ function withTimeout(promise, ms, label) {
 }
 
 async function fetchImageAsBase64(imageUrl) {
-  console.log("[Worker] Fetching image from:", imageUrl);
   const response = await withTimeout(
     axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 12000 }),
-    15000,
-    'Image fetch'
+    15000, 'Image fetch'
   );
   const base64 = Buffer.from(response.data).toString('base64');
   const ct = response.headers['content-type'] || 'image/jpeg';
   const mimeType = ct.split(';')[0].trim();
-  console.log(`[Worker] Image fetched. Size: ${base64.length} chars, mime: ${mimeType}`);
+  console.log(`[Worker] Image fetched OK — ${base64.length} chars, mime: ${mimeType}`);
   return { base64, mimeType };
 }
 
@@ -76,8 +73,8 @@ async function callGeminiAPI(imageUrl) {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
-    console.log("[Worker] No GEMINI_API_KEY — using mock response.");
-    await new Promise(r => setTimeout(r, 800));
+    console.log("[Worker] No GEMINI_API_KEY — using mock.");
+    await new Promise(r => setTimeout(r, 600));
     return getRandomMock();
   }
 
@@ -85,149 +82,158 @@ async function callGeminiAPI(imageUrl) {
   try {
     imageData = await fetchImageAsBase64(imageUrl);
   } catch (err) {
-    console.warn("[Worker] Image fetch failed:", err.message, "— using mock.");
+    console.warn("[Worker] Image fetch failed:", err.message, "→ using mock.");
     return getRandomMock();
   }
 
-  console.log("[Worker] Calling Gemini API...");
   try {
+    console.log("[Worker] Calling Gemini API...");
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-    const requestBody = {
-      contents: [{
-        parts: [
-          {
-            text: `Analyze this image and return ONLY a JSON object with exactly these fields:
-1. mood_tags: array of 3-4 short mood/style keywords (e.g. ["cozy", "warm", "nostalgic"])
-2. poetic_caption: one poetic sentence matching the image mood (max 150 chars)
-3. short_captions: array of exactly 2 short punchy social captions with emojis`
-          },
-          { inlineData: { mimeType: imageData.mimeType, data: imageData.base64 } }
-        ]
-      }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.7,
-        maxOutputTokens: 300,
-        responseSchema: {
-          type: "object",
-          properties: {
-            mood_tags:      { type: "array", items: { type: "string" } },
-            poetic_caption: { type: "string" },
-            short_captions: { type: "array", items: { type: "string" } }
-          },
-          required: ["mood_tags", "poetic_caption", "short_captions"]
-        }
-      }
-    };
-
     const response = await withTimeout(
-      axios.post(url, requestBody, {
+      axios.post(url, {
+        contents: [{
+          parts: [
+            {
+              text: `Analyze this image. Return ONLY valid JSON with these exact fields:
+{
+  "mood_tags": ["tag1", "tag2", "tag3"],
+  "poetic_caption": "one evocative sentence about the image",
+  "short_captions": ["short caption 1 with emoji", "short caption 2 with emoji"]
+}`
+            },
+            { inlineData: { mimeType: imageData.mimeType, data: imageData.base64 } }
+          ]
+        }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.7,
+          maxOutputTokens: 256,
+        }
+      }, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 25000
       }),
-      28000,
-      'Gemini API call'
+      28000, 'Gemini API'
     );
 
     const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) throw new Error("Empty Gemini response");
 
-    const parsed = JSON.parse(text);
-    // Validate the response has required fields
-    if (!parsed.mood_tags || !parsed.poetic_caption || !parsed.short_captions) {
-      throw new Error("Gemini response missing required fields");
+    // Strip markdown code fences if present
+    const clean = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const parsed = JSON.parse(clean);
+
+    if (!Array.isArray(parsed.mood_tags) || !parsed.poetic_caption || !Array.isArray(parsed.short_captions)) {
+      throw new Error("Gemini response missing required fields: " + JSON.stringify(parsed));
     }
-    console.log("[Worker] Gemini response OK. Tags:", parsed.mood_tags);
+
+    // Ensure short_captions has at least 2 items
+    while (parsed.short_captions.length < 2) {
+      parsed.short_captions.push("Capturing the moment. ✨");
+    }
+
+    console.log("[Worker] Gemini OK — tags:", parsed.mood_tags);
     return parsed;
 
   } catch (err) {
     console.error("[Worker] Gemini failed:", err.message);
     if (err.response?.data) {
-      console.error("[Worker] Gemini error detail:", JSON.stringify(err.response.data).slice(0, 300));
+      console.error("[Worker] Detail:", JSON.stringify(err.response.data).slice(0, 400));
     }
-    console.log("[Worker] Falling back to mock response.");
+    console.log("[Worker] Using mock response as fallback.");
     return getRandomMock();
   }
 }
 
 async function processCaptionJob(job) {
   const { postId, imageUrl } = job.data;
-  console.log(`[Worker] ── Starting job for post ${postId}`);
+  console.log(`\n[Worker] ── Job start: ${postId}`);
   console.log(`[Worker]    imageUrl: ${imageUrl}`);
 
-  // Safety net: mark as failed after 60s no matter what
-  const jobTimeout = setTimeout(async () => {
-    console.error(`[Worker] ⏰ Job ${postId} hit 60s safety timeout — marking failed.`);
+  // 60s hard safety net
+  const safetyTimer = setTimeout(async () => {
+    console.error(`[Worker] ⏰ Safety timeout hit for ${postId} — marking failed.`);
     try { await db.updatePost(postId, { status: 'failed' }); } catch {}
   }, 60000);
 
   try {
-    await db.updatePost(postId, { status: 'processing' });
-
-    // Step 3: AI captions
+    // Step 3: AI captions — ALWAYS returns something (mock on any failure)
     const aiOutput = await callGeminiAPI(imageUrl);
     const { mood_tags, poetic_caption, short_captions } = aiOutput;
 
+    console.log(`[Worker] Building variations...`);
     const variations = [
       {
         moodTags: mood_tags,
-        poeticCaption: poetic_caption
+        poeticCaption: poetic_caption,
+        predictedScore: 70,
+        isBest: false
       },
       {
         moodTags: [mood_tags[0] || 'aesthetic', 'daily'],
-        poeticCaption: short_captions[0] || "Chasing moments."
+        poeticCaption: short_captions[0],
+        predictedScore: 60,
+        isBest: false
       },
       {
         moodTags: [mood_tags[1] || 'vibes', mood_tags[2] || 'mood'],
-        poeticCaption: short_captions[1] || "Just living."
+        poeticCaption: short_captions[1],
+        predictedScore: 50,
+        isBest: false
       }
     ];
 
-    // Step 4: Engagement predictions
-    let predictionData = {
-      predictions: variations.map((v, i) => ({
-        ...v,
-        predictedScore: 50 + (i * 10),
-        isBest: i === 0
-      })),
-      bestIndex: 0
-    };
-
+    // Step 4: Python predictions (optional)
     try {
       const pythonServiceUrl = process.env.PYTHON_SERVICE_URL || 'http://localhost:5000';
-      const pyResponse = await withTimeout(
+      const pyRes = await withTimeout(
         axios.post(`${pythonServiceUrl}/predict`, { variations }, { timeout: 4000 }),
-        5000,
-        'Python predict'
+        5000, 'Python predict'
       );
-      predictionData = pyResponse.data;
-      console.log(`[Worker] Python predictions OK. Best index: ${predictionData.bestIndex}`);
+      const preds = pyRes.data.predictions;
+      const bestIdx = pyRes.data.bestIndex || 0;
+      preds.forEach((p, i) => { p.isBest = i === bestIdx; });
+      variations.splice(0, variations.length, ...preds);
+      console.log(`[Worker] Python predictions OK.`);
     } catch (pyErr) {
-      console.warn("[Worker] Python service unavailable:", pyErr.message);
+      // Mark variation[0] as best when Python is unavailable
+      variations[0].isBest = true;
+      variations[0].predictedScore = 70;
+      variations[1].predictedScore = 60;
+      variations[2].predictedScore = 50;
+      console.warn("[Worker] Python unavailable — using baseline scores.");
     }
 
-    const bestVar = predictionData.predictions[predictionData.bestIndex];
+    const bestVar = variations.find(v => v.isBest) || variations[0];
 
-    // Step 5: Save to DB
-    await db.updatePost(postId, {
+    // Step 5: Save — this is the critical write
+    const updatePayload = {
       status: 'completed',
       content: {
         moodTags: bestVar.moodTags,
         poeticCaption: bestVar.poeticCaption,
-        variations: predictionData.predictions
+        variations: variations
       },
       analytics: {
-        predictedScore: bestVar.predictedScore,
+        predictedScore: bestVar.predictedScore || 70,
         actualLikes: 0,
         actualShares: 0
       }
-    });
+    };
 
-    clearTimeout(jobTimeout);
-    console.log(`[Worker] ✅ Job ${postId} completed successfully.`);
+    console.log(`[Worker] Saving to DB...`);
+    console.log(`[Worker] moodTags: ${JSON.stringify(bestVar.moodTags)}`);
+    console.log(`[Worker] caption: ${bestVar.poeticCaption?.slice(0, 60)}`);
+
+    const saved = await db.updatePost(postId, updatePayload);
+    
+    if (!saved) throw new Error("db.updatePost returned null — post may not exist");
+
+    clearTimeout(safetyTimer);
+    console.log(`[Worker] ✅ Job ${postId} complete.\n`);
 
   } catch (err) {
-    clearTimeout(jobTimeout);
+    clearTimeout(safetyTimer);
     console.error(`[Worker] ❌ Job ${postId} failed:`, err.message);
     try { await db.updatePost(postId, { status: 'failed' }); } catch {}
     throw err;
