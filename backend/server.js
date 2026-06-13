@@ -15,7 +15,11 @@ console.log("REDIS_URL =", process.env.REDIS_URL);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+app.use(cors({
+  origin: ['poetic-caption-analytics.vercel.app', 'http://localhost:5173'],
+  credentials: true
+}));
+
 app.use(express.json());
 
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
